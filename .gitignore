@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local secrets and environment
+.env
+.env.*
+!.env.example
+
+# Data generated during experiments
+/data/cache/
+/data/raw/
+/reports/generated/
+*.log
+
+# Model and training artifacts (keep these outside the repo or add selectively)
+/checkpoints/
+/adapters/
+*.safetensors
+*.bin
+*.gguf
