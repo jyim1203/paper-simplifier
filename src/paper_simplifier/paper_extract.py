@@ -10,18 +10,59 @@ from typing import Callable
 from .latex_extract import extract_tex_project
 
 
-def _find_tex_entrypoint(root: Path) -> Path | None:
-    preferred = ("_main.tex", "main.tex", "paper.tex")
+def _toplevel_from_00readme(root: Path) -> str | None:
+    """arXiv ships 00README.json naming the canonical toplevel file.
+
+    Reading it beats guessing: a paper whose real root is ``main_arxiv.tex``
+    often still ships a ``main.tex`` that is only a body fragment, and picking
+    the fragment silently loses the title and abstract.
+    """
+    manifest = root / "00README.json"
+    if not manifest.is_file():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8", errors="ignore"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    for entry in data.get("sources", []) or []:
+        if isinstance(entry, dict) and entry.get("usage") == "toplevel":
+            filename = entry.get("filename")
+            if filename and (root / filename).is_file():
+                return filename
+    return None
+
+
+def _looks_like_root(path: Path) -> bool:
+    """A real root document has a preamble and/or a document body."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "\\begin{document}" in text or "\\documentclass" in text
+
+
+def _find_tex_entrypoint(root: Path) -> tuple[Path | None, str | None]:
+    """Pick the TeX root: 00README first, then validated preferred names."""
+    declared = _toplevel_from_00readme(root)
+    if declared:
+        return root / declared, "00readme"
+
+    preferred = ("_main.tex", "main.tex", "paper.tex", "manuscript.tex")
     for name in preferred:
         path = root / name
-        if path.is_file():
-            return path
+        if path.is_file() and _looks_like_root(path):
+            return path, "preferred_name"
+
     candidates = sorted(root.glob("*.tex"))
     for path in candidates:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        if "\\begin{document}" in text and "\\documentclass" in text:
-            return path
-    return None
+        if "\\documentclass" in path.read_text(encoding="utf-8", errors="ignore"):
+            return path, "documentclass_scan"
+    for path in candidates:
+        if _looks_like_root(path):
+            return path, "document_body_scan"
+    if candidates:
+        return candidates[0], "first_tex_file"
+    return None, None
 
 
 def _find_pdf(root: Path) -> Path | None:
@@ -32,12 +73,12 @@ def _find_pdf(root: Path) -> Path | None:
 def select_extraction_input(root: str | Path) -> dict:
     """Choose the preferred TeX entrypoint, otherwise one PDF."""
     root_path = Path(root).resolve()
-    tex = _find_tex_entrypoint(root_path)
+    tex, source = _find_tex_entrypoint(root_path)
     if tex:
-        return {"method": "latex_source", "path": tex}
+        return {"method": "latex_source", "path": tex, "entrypoint_source": source}
     pdf = _find_pdf(root_path)
     if pdf:
-        return {"method": "pdf_text", "path": pdf}
+        return {"method": "pdf_text", "path": pdf, "entrypoint_source": "pdf"}
     raise FileNotFoundError(f"no TeX entrypoint or PDF found in {root_path}")
 
 
@@ -80,6 +121,7 @@ def extract_paper(root: str | Path) -> dict:
         record = extract_pdf_text(selected["path"])
     record["source_selection"] = selected["method"]
     record["source_path"] = str(selected["path"].name)
+    record.setdefault("entrypoint_source", selected.get("entrypoint_source"))
     return record
 
 

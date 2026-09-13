@@ -4,8 +4,8 @@ This file records decisions and verified milestones. It is not a substitute for 
 
 ## Current status
 
-**Phase:** Ingestion pilot — TeX/PDF extraction slice implemented  
-**Next action:** Run the extractor on a real source archive copied into the workspace, then add quality thresholds and token measurements  
+**Phase:** Ingestion pilot — LaTeX (TeX source) parser verified against real sources  
+**Next action:** Fix the PDF fallback route (documented in `PROGRESS.md` findings), then add the quality gate and token measurements  
 **Overall status:** In progress
 
 ## Decisions locked so far
@@ -70,6 +70,7 @@ This file records decisions and verified milestones. It is not a substitute for 
 - [x] Add PDF text fallback extraction.
 - [x] Extract title, abstract, introduction, conclusion, and discussion fallback.
 - [x] Save extraction warnings and quality flags.
+- [x] Harden TeX extraction: brace-balanced heading boundaries, prefix section-name matching, literal input resolution, visual/math environment stripping, empty-field warnings.
 - [ ] Measure token counts with a candidate Qwen tokenizer.
 - [ ] Report archive and processed-data sizes.
 - [ ] Manually inspect pilot records.
@@ -105,6 +106,7 @@ This file records decisions and verified milestones. It is not a substitute for 
 | Date | Stage | Artifact/result | Decision or next action |
 |---|---|---|---|
 | 2026-09-10 | Planning | Initial design reviewed | Architecture documents created; pilot is next |
+| 2026-09-12 | Ingestion pilot | `tools/parser_probes.py` 16/16; `tools/corpus_quality_check.py` over 18 real arXiv sources: title/abstract/conclusion 100%, intro 94% (one paper's intro is commented out upstream), TeX-artifact residue 0% | LaTeX parser accepted; PDF fallback and quality gate are next |
 
 ## Definition of done for the pilot
 

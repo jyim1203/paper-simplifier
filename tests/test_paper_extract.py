@@ -72,5 +72,32 @@ class PaperExtractTests(unittest.TestCase):
         self.assertNotIn("FIGURE COMMANDS", record["introduction"])
 
 
+    def test_selection_prefers_00readme_toplevel_over_guessed_names(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "00README.json").write_text(
+                '{"sources": [{"usage": "toplevel", "filename": "real_root.tex"}]}',
+                encoding="utf-8",
+            )
+            (root / "real_root.tex").write_text(
+                "\\documentclass{article}\n\\begin{document}\n\\end{document}", encoding="utf-8"
+            )
+            (root / "main.tex").write_text("\\section{Introduction}\nfragment", encoding="utf-8")
+            selected = select_extraction_input(root)
+        self.assertEqual(selected["path"].name, "real_root.tex")
+        self.assertEqual(selected["entrypoint_source"], "00readme")
+
+    def test_selection_skips_body_only_fragment_named_main(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "main.tex").write_text("\\section{Introduction}\nbody only", encoding="utf-8")
+            (root / "manuscript.tex").write_text(
+                "\\documentclass{article}\n\\title{T}\n\\begin{document}\n\\end{document}",
+                encoding="utf-8",
+            )
+            selected = select_extraction_input(root)
+        self.assertEqual(selected["path"].name, "manuscript.tex")
+
+
 if __name__ == "__main__":
     unittest.main()

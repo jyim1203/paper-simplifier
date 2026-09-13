@@ -51,7 +51,9 @@ NOISE_PATTERNS = {
     "ampersand": re.compile(r"&"),
     "dollar": re.compile(r"\$"),
     "env_marker": re.compile(r"\\(?:begin|end)\{"),
-    "option_bracket": re.compile(r"\[[A-Za-z0-9=.\\-]{1,24}\]"),
+    # TeX option residue like [t], [H], [width=0.9\linewidth]; not prose labels
+    # such as "[Model]" which some papers use legitimately.
+    "option_bracket": re.compile(r"\[(?:[a-zA-Z]+=[^\]]*|[bhtH!p])\]"),
 }
 
 # Style-diverse fallback used when the arXiv API is rate-limiting.
@@ -113,8 +115,11 @@ def check_one(vid: str, *, use_cache: bool) -> dict:
     if not src.is_dir() and any(workdir.glob("*.tex")):
         src = workdir
     cached = src.is_dir()
+    if use_cache and not cached:
+        row["error"] = "not_cached"
+        return row
 
-    if not (use_cache and cached):
+    if not cached:
         archive = workdir / "source.tar"
         if archive.is_file():
             archive.unlink()
