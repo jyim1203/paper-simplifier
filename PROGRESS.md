@@ -4,9 +4,9 @@ This file records decisions and verified milestones. It is not a substitute for 
 
 ## Current status
 
-**Phase:** Ingestion pilot — LaTeX (TeX source) parser verified against real sources  
-**Next action:** Fix the PDF fallback route (documented in `PROGRESS.md` findings), then add the quality gate and token measurements  
-**Overall status:** In progress
+**Phase:** Ingestion pilot — LaTeX parser reviewed; 3 silent-corruption defects open  
+**Next action:** Fix defects 1–3 under "Review findings" below, then the quality gate and token measurements, then the PDF fallback route  
+**Overall status:** In progress — the parser is NOT yet trustworthy for label generation
 
 ## Decisions locked so far
 
@@ -107,6 +107,39 @@ This file records decisions and verified milestones. It is not a substitute for 
 |---|---|---|---|
 | 2026-09-10 | Planning | Initial design reviewed | Architecture documents created; pilot is next |
 | 2026-09-12 | Ingestion pilot | `tools/parser_probes.py` 16/16; `tools/corpus_quality_check.py` over 18 real arXiv sources: title/abstract/conclusion 100%, intro 94% (one paper's intro is commented out upstream), TeX-artifact residue 0% | LaTeX parser accepted; PDF fallback and quality gate are next |
+| 2026-09-13 | Review | Independent review subagent re-ran the suite (27 tests, 9 subtests), the probes (16/16) and the corpus harness; reproduced 3 silent-corruption defects | Parser accepted with defects open; see "Review findings" |
+
+## Review findings — parser hardening (2026-09-13)
+
+An independent review subagent re-ran the tests and probes and hunted for silent failure modes.
+
+- Confirmed directly: 16/16 probes; 27 tests passed, 9 subtests passed.
+- Confirmed: all eight hardening features behave as described.
+- Refuted: the "18 sources; title/abstract/conclusion 100%; residue 0%" figure is **not
+  reproducible**. The harness's default sample is capped at 10 IDs (the arXiv API returned
+  HTTP 429 and the fallback list holds 10 entries). Over the 29 sources actually cached:
+  title 96%, abstract 100%, introduction 96%, conclusion-or-fallback 100%, noise-flagged 7%
+  — and both noise hits are false positives of the harness's own `&` heuristic (literal prose
+  ampersands). Real TeX residue was 0 on that sample.
+
+### Open defects
+
+Defects 1–3 produce **silently wrong fields with no warning** and were reproduced independently.
+
+| # | Defect | Impact | Where |
+|---|---|---|---|
+| 1 | A heading command inside a macro definition registers as a real section boundary | Wrong `conclusion`, no warning | `_section_blocks` runs on raw text before definitions are removed |
+| 2 | Heading-like text inside `verbatim`/`lstlisting` registers as a heading | Real section silently truncated or lost | `_section_blocks` runs before `_strip_environments` |
+| 3 | A two-brace-group `\cite{a}{b}` leaks the second group into prose | TeX residue / injected prose | `_DROP_COMMAND_WITH_ARG_RE` consumes only one `{..}` group |
+| 4 | `\chapter`-style documents lose both introduction and conclusion | Content dropped (warns) | `_section_blocks` picks `\section` whenever any exists |
+| 5 | Escaped braces `\{x\}` leave stray backslashes | Residue | `_BRACE_RE` / `_ESCAPED_CHAR_RE` |
+| 6 | Harness caches an empty `src/` for PDF-only papers | Mislabeled measurement | `corpus_quality_check.py`: `dest.mkdir` runs before the `%PDF` check |
+| 7 | Custom macros are deleted from prose instead of expanded | Empty macro-based titles (drives the title 96%) | `normalize_tex_text` (`_COMMAND_RE`) |
+
+Also confirmed: PyMuPDF is not installed, so the PDF route **raises `RuntimeError`** out of
+`paper_extract.py` rather than returning a record carrying warnings.
+
+Parsing must not be trusted for label generation until defects 1–3 are fixed.
 
 ## Definition of done for the pilot
 
