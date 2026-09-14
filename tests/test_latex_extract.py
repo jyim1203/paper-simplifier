@@ -331,5 +331,68 @@ Discussion text.""",
         )
 
 
+    def test_defined_text_macros_are_expanded_in_title_and_prose(self):
+        """\\newcommand text macros must be inlined, not deleted.
+
+        Real papers define their model names this way (\\dsviv -> DeepSeek-V4);
+        deleting the macro silently strips the name from the title, abstract and
+        body while every field still looks non-empty.
+        """
+        main = (
+            "\\documentclass{article}\n"
+            "\\newcommand{\\dsviv}{DeepSeek-V4}\n"
+            "\\newcommand{\\dsvivp}{DeepSeek-V4-Pro}\n"
+            "\\title{\\dsviv{}: A Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}We present \\dsviv{} and \\dsvivp{}.\\end{abstract}\n"
+            f"\\section{{Introduction}}\n{PROSE} We use \\dsviv{{}} here.\n"
+            f"\\section{{Conclusion}}\n{PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertIn("DeepSeek-V4", record["title"])
+        self.assertIn("DeepSeek-V4-Pro", record["abstract"])
+        self.assertIn("DeepSeek-V4", record["introduction"])
+        self.assertNotIn("dsviv", record["abstract"])
+
+    def test_parameterised_macro_body_is_not_inlined(self):
+        """A macro with arguments cannot be inlined without parsing call sites.
+
+        Guard against over-eager expansion: inlining ``[[#1]]`` would leak
+        parameter placeholders into prose.
+        """
+        main = (
+            "\\documentclass{article}\n"
+            "\\newcommand{\\wrap}[1]{[[#1]]}\n"
+            "\\title{A Test Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\section{{Introduction}}\n{PROSE} we \\wrap{{use}} it.\n"
+            f"\\section{{Conclusion}}\n{PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertNotIn("[[#1]]", record["introduction"])
+        self.assertIn("use", record["introduction"])
+
+
+    def test_line_break_is_not_half_eaten_by_the_thin_space_rule(self):
+        """A LaTeX line break ``\\\\`` must not leave a stray backslash.
+
+        The thin-space rule matches backslash+space, so it eats the second half
+        of a line break unless the line-break rule runs first. Titles using
+        ``\\\\`` for a visual break showed the residue.
+        """
+        normalized = normalize_tex_text(r"DeepSeek-V4: \\ Towards Efficiency")
+        self.assertNotIn("\\", normalized)
+        self.assertIn("Towards Efficiency", normalized)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,7 +24,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 
 _INPUT_RE = re.compile(r"\\(?:input|include)\s*\{([^}]+)\}")
@@ -321,6 +321,108 @@ def _strip_definitions(text: str) -> str:
     return "".join(out)
 
 
+def _skip_whitespace(text: str, index: int) -> int:
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    return index
+
+
+def _iter_definitions(text: str) -> Iterator[tuple[str, int, str]]:
+    """Yield ``(name, argument_count, body)`` for each macro definition.
+
+    Bodies are read with the bracket scanner, so a nested body such as
+    ``\newcommand{\\x}{\\section{Y}}`` is understood as one definition.
+    """
+    for match in _DEFINITION_HEAD_RE.finditer(text):
+        head = match.group(0).lstrip()
+        cursor = _skip_whitespace(text, match.end())
+        if head.startswith("\\def"):
+            name_match = re.compile(r"\\([a-zA-Z@]+)").match(text, cursor)
+            if name_match is None:
+                continue
+            name = name_match.group(1)
+            cursor = name_match.end()
+            argument_count = 0
+            while True:
+                marker = re.compile(r"\s*#(\d)").match(text, cursor)
+                if marker is None:
+                    break
+                argument_count = max(argument_count, int(marker.group(1)))
+                cursor = marker.end()
+        else:
+            if cursor < len(text) and text[cursor] == "{":
+                group = _balanced_group(text, cursor)
+                if group is None:
+                    continue
+                name_match = re.match(r"\s*\\([a-zA-Z@]+)", group[0])
+                if name_match is None:
+                    continue
+                name = name_match.group(1)
+                cursor = group[1]
+            else:
+                name_match = re.compile(r"\\([a-zA-Z@]+)").match(text, cursor)
+                if name_match is None:
+                    continue
+                name = name_match.group(1)
+                cursor = name_match.end()
+            argument_count = 0
+            cursor = _skip_whitespace(text, cursor)
+            if cursor < len(text) and text[cursor] == "[":
+                close = text.find("]", cursor)
+                if close != -1:
+                    declared = text[cursor + 1 : close].strip()
+                    if declared.isdigit():
+                        argument_count = int(declared)
+                    cursor = close + 1
+            cursor = _skip_whitespace(text, cursor)
+            if cursor < len(text) and text[cursor] == "[":
+                close = text.find("]", cursor)
+                if close != -1:
+                    cursor = close + 1
+        cursor = _skip_whitespace(text, cursor)
+        if cursor >= len(text) or text[cursor] != "{":
+            continue
+        body = _balanced_group(text, cursor)
+        if body is None:
+            continue
+        yield name, argument_count, body[0]
+
+
+def _collect_macros(text: str) -> dict[str, str]:
+    """Name -> expansion for definitions safe to inline.
+
+    Only zero-argument definitions are collected: a macro with parameters
+    cannot be expanded without parsing its call sites, so it is left alone and
+    dropped later like any other unknown command. Real papers define model
+    names this way (``\\dsviv`` -> ``DeepSeek-V4``), and deleting those silently
+    strips the name from the title, abstract and body.
+    """
+    macros: dict[str, str] = {}
+    for name, argument_count, body in _iter_definitions(text):
+        if argument_count:
+            continue
+        macros[name] = body
+    return macros
+
+
+def _expand_macros(text: str, macros: dict[str, str]) -> str:
+    """Inline simple text macros, resolving nested definitions a few levels deep."""
+    if not macros:
+        return text
+    pattern = re.compile(r"\\([a-zA-Z@]+)(\s*\{\})?")
+
+    def replace(match: re.Match[str]) -> str:
+        body = macros.get(match.group(1))
+        return match.group(0) if body is None else body
+
+    for _ in range(6):
+        expanded = pattern.sub(replace, text)
+        if expanded == text:
+            break
+        text = expanded
+    return text
+
+
 def _unwrap_commands(text: str) -> str:
     previous = None
     while previous != text:
@@ -336,17 +438,21 @@ def _unwrap_commands(text: str) -> str:
     return text
 
 
-def normalize_tex_text(text: str) -> str:
+def normalize_tex_text(text: str, macros: dict[str, str] | None = None) -> str:
     """Turn common TeX prose into readable plain text without claiming perfect fidelity."""
     text = _COMMENT_RE.sub("", text)
     text = _strip_environments(text)
+    text = _expand_macros(text, macros or {})
     # Protect escaped dollars so inline-math pairing cannot swallow prose.
     text = text.replace("\\$", _DOLLAR_SENTINEL)
     text = _MATH_DISPLAY_RE.sub(" ", text)
     text = _MATH_INLINE_RE.sub(" ", text)
     text = text.replace("$", " ").replace(_DOLLAR_SENTINEL, "$")
-    text = _THIN_SPACE_RE.sub(" ", text)
+    # Order matters: the thin-space rule matches backslash followed by a space,
+    # so it would eat the second half of a ``\\`` line break and leave a stray
+    # backslash behind (visible in titles that break a line).
     text = _LINE_BREAK_RE.sub(" ", text)
+    text = _THIN_SPACE_RE.sub(" ", text)
     text = text.replace("~", " ").replace("---", "-").replace("--", "-")
     text = _unwrap_commands(text)
     text = _ENV_COMMAND_RE.sub(" ", text)
@@ -408,6 +514,9 @@ def extract_tex_project(entrypoint: str | Path) -> dict:
     """Extract the project-level fields needed by the pilot dataset."""
     raw, warnings = load_tex_project(entrypoint)
     raw = re.sub(r"\\end\{document\}.*$", "", raw, flags=re.DOTALL)
+    # Definitions are removed before section scanning, so the macro table has to
+    # be built from the raw source while the definitions are still present.
+    macros = _collect_macros(raw)
 
     title_text = _balanced_argument(raw, "title")
     abstract_env = _ABSTRACT_ENV_RE.search(raw)
@@ -427,16 +536,16 @@ def extract_tex_project(entrypoint: str | Path) -> dict:
     conclusion = _pick(blocks, _CONCLUSION_EXACT, _CONCLUSION_PREFIX)
     discussion = _pick(blocks, _DISCUSSION_EXACT, _DISCUSSION_PREFIX)
 
-    title = normalize_tex_text(title_text) if title_text else ""
-    abstract = normalize_tex_text(abstract_text) if abstract_text else ""
-    intro_body = normalize_tex_text(introduction[1]) if introduction else ""
+    title = normalize_tex_text(title_text, macros) if title_text else ""
+    abstract = normalize_tex_text(abstract_text, macros) if abstract_text else ""
+    intro_body = normalize_tex_text(introduction[1], macros) if introduction else ""
     conclusion_source = (
         conclusion[0] if conclusion else discussion[0] if discussion else None
     )
     conclusion_body = (
         conclusion[1] if conclusion else discussion[1] if discussion else ""
     )
-    conclusion_text = normalize_tex_text(conclusion_body)
+    conclusion_text = normalize_tex_text(conclusion_body, macros)
 
     if not title:
         warnings.append("title_not_found")
