@@ -4,9 +4,9 @@ This file records decisions and verified milestones. It is not a substitute for 
 
 ## Current status
 
-**Phase:** Ingestion pilot — LaTeX parser reviewed; 3 silent-corruption defects open  
-**Next action:** Fix defects 1–3 under "Review findings" below, then the quality gate and token measurements, then the PDF fallback route  
-**Overall status:** In progress — the parser is NOT yet trustworthy for label generation
+**Phase:** Ingestion pilot — LaTeX parser defects 1–3 fixed and verified  
+**Next action:** Fix defects 4–7 under "Review findings" below, then the quality gate and token measurements, then the PDF fallback route  
+**Overall status:** In progress — parser usable for the pilot; defects 4–7 and the PDF route remain
 
 ## Decisions locked so far
 
@@ -108,6 +108,7 @@ This file records decisions and verified milestones. It is not a substitute for 
 | 2026-09-10 | Planning | Initial design reviewed | Architecture documents created; pilot is next |
 | 2026-09-12 | Ingestion pilot | `tools/parser_probes.py` 16/16; `tools/corpus_quality_check.py` over 18 real arXiv sources: title/abstract/conclusion 100%, intro 94% (one paper's intro is commented out upstream), TeX-artifact residue 0% | LaTeX parser accepted; PDF fallback and quality gate are next |
 | 2026-09-13 | Review | Independent review subagent re-ran the suite (27 tests, 9 subtests), the probes (16/16) and the corpus harness; reproduced 3 silent-corruption defects | Parser accepted with defects open; see "Review findings" |
+| 2026-09-13 | Fix | Defects 1–3 fixed tests-first (27 → 30 tests). Follow-up review found the defect-3 fix had over-reached and deleted prose after `\label`; scoped to citations (31 tests) | Corpus diff 1/29, an improvement; defects 4–7 open |
 
 ## Review findings — parser hardening (2026-09-13)
 
@@ -139,7 +140,24 @@ Defects 1–3 produce **silently wrong fields with no warning** and were reprodu
 Also confirmed: PyMuPDF is not installed, so the PDF route **raises `RuntimeError`** out of
 `paper_extract.py` rather than returning a record carrying warnings.
 
-Parsing must not be trusted for label generation until defects 1–3 are fixed.
+### Resolution (2026-09-13)
+
+Defects 1–3 are fixed and verified. Defects 4–7 and the PDF route are still open.
+
+| # | Status |
+|---|---|
+| 1 | Fixed — `_strip_definitions` reads macro bodies with a bracket scanner |
+| 2 | Fixed — environments are stripped before the heading scan |
+| 3 | Fixed — `_TWO_GROUP_CITE_RE` drops a citation's second mandatory group |
+| 4–7 | Open |
+
+The first attempt at defect 3 added the second group to the *shared* drop regex,
+so it applied to every drop-command. `\label{key}{prose}` then deleted the prose,
+and 2401.00664v7's abstract silently lost real sentences. A follow-up review
+caught it; the rule is now scoped to citations only.
+
+Corpus diff against the pre-fix parser: 1 of 29 papers differs, and that one is
+an improvement (macro residue removed from a conclusion).
 
 ## Definition of done for the pilot
 
