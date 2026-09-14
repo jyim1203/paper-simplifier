@@ -264,5 +264,55 @@ Discussion text.""",
         self.assertIn("abstract_not_found", record["extraction_warnings"])
 
 
+    def test_heading_inside_macro_definition_is_not_a_section_boundary(self):
+        """A \\section living inside a \\newcommand must not create a section."""
+        main = (
+            "\\documentclass{article}\n"
+            "\\newcommand{\\conclusionheader}{\\section{Conclusion}}\n"
+            "\\title{A Test Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\section{{Introduction}}\n{PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertEqual(record["conclusion"], "")
+        self.assertIn("conclusion_or_discussion_not_found", record["extraction_warnings"])
+
+    def test_heading_like_text_inside_verbatim_is_not_a_section_boundary(self):
+        """A heading-looking line inside verbatim must not truncate a section."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {
+                "main.tex": full_doc(
+                    f"\\section{{Introduction}}\n{PROSE}\n"
+                    "\\begin{verbatim}\n\\section{Conclusion}\n"
+                    "fake conclusion text\n\\end{verbatim}\n"
+                    f"\\section{{Conclusion}}\n{PROSE}"
+                ),
+            })
+            record = extract_tex_project(root / "main.tex")
+        self.assertNotIn("fake conclusion text", record["conclusion"])
+        self.assertIn("sufficiently long body", record["conclusion"])
+
+    def test_citation_with_two_mandatory_groups_leaves_no_residue(self):
+        """\\citep{key}{postnote} must not leak the second group into prose."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {
+                "main.tex": full_doc(
+                    f"\\section{{Introduction}}\n{PROSE} As shown by "
+                    "\\citep{smith2020}{extra group words} we improve things.\n"
+                    f"\\section{{Conclusion}}\n{PROSE}"
+                ),
+            })
+            record = extract_tex_project(root / "main.tex")
+        self.assertNotIn("extra group words", record["introduction"])
+        self.assertNotIn("smith2020", record["introduction"])
+
+
 if __name__ == "__main__":
     unittest.main()

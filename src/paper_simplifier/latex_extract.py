@@ -94,9 +94,11 @@ _DROP_COMMAND_WITH_ARG_RE = re.compile(
     r"vspace|hspace|vskip|hskip|smallskip|medskip|bigskip|"
     r"index|glossary|hypersetup|geometry|captionsetup|graphicspath|"
     r"usepackage|documentclass|includegraphics|setlength|addtolength)"
-    r"\s*(?:\[[^\]]*\])*\s*\{[^{}]*\}"
+    r"\s*(?:\[[^\]]*\])*\s*\{[^{}]*\}(?:\{[^{}]*\})?"
 )
-# Two-argument commands where only the second argument is prose.
+# The trailing optional group swallows a second, immediately adjacent mandatory
+# argument (``\\citep{key}{postnote}``). It is deliberately space-sensitive:
+# ``\\cite{key} {prose}`` keeps its prose.
 _TWO_ARG_UNWRAP_RE = re.compile(
     r"\\(?:href|textcolor|colorbox|texorpdfstring|pdftooltip)"
     r"\s*\{[^{}]*\}\s*\{([^{}]*)\}"
@@ -113,6 +115,14 @@ _DEFINITION_RE = re.compile(
     r"\s*\*?\s*\{[^{}]*\}(?:\s*\[[^\]]*\])?(?:\s*\{[^{}]*\})?(?:\s*\{[^{}]*\})?"
 )
 _PLAIN_DEF_RE = re.compile(r"\\def\s*\\[a-zA-Z@]+\s*(?:#\d\s*)*\{[^{}]*\}")
+
+# Definition commands whose bodies can hold balanced brace groups, e.g.
+# ``{\section{Conclusion}}``. _DEFINITION_RE's flat ``[^{}]*`` cannot match
+# those, so they are consumed by _strip_definitions with a bracket scanner.
+_DEFINITION_HEAD_RE = re.compile(
+    r"\\(?:newcommand|renewcommand|providecommand|DeclareMathOperator|newenvironment)\b\s*\*?"
+    r"|\\def\b(?=\s*\\[a-zA-Z@])"
+)
 
 # --- math and escaping ------------------------------------------------------
 
@@ -260,6 +270,52 @@ def _strip_environments(text: str) -> str:
     return "".join(out)
 
 
+def _strip_definitions(text: str) -> str:
+    """Remove macro definitions, including bodies that contain nested braces.
+
+    ``\\newcommand{\\x}{\\section{Conclusion}}`` defines a heading command; it is
+    not a section. Left in place, its body registers as a phantom section
+    boundary and the prose after it is silently attributed to "Conclusion".
+    """
+    out: list[str] = []
+    pos = 0
+    while True:
+        match = _DEFINITION_HEAD_RE.search(text, pos)
+        if match is None:
+            out.append(text[pos:])
+            break
+        out.append(text[pos : match.start()])
+        cursor = match.end()
+        if match.group(0).lstrip().startswith("\\def"):
+            name = re.compile(r"\s*\\[a-zA-Z@]+").match(text, cursor)
+            if name is not None:
+                cursor = name.end()
+            while True:
+                marker = re.compile(r"\s*#\d").match(text, cursor)
+                if marker is None:
+                    break
+                cursor = marker.end()
+        # Consume the signature and body groups: {\\name}, [n], [default], {body}.
+        for _ in range(5):
+            whitespace = re.compile(r"[ \t]*").match(text, cursor)
+            cursor = whitespace.end()
+            if cursor < len(text) and text[cursor] == "[":
+                close = text.find("]", cursor)
+                if close == -1:
+                    break
+                cursor = close + 1
+                continue
+            if cursor < len(text) and text[cursor] == "{":
+                group = _balanced_group(text, cursor)
+                if group is None:
+                    break
+                cursor = group[1]
+                continue
+            break
+        pos = cursor
+    return "".join(out)
+
+
 def _unwrap_commands(text: str) -> str:
     previous = None
     while previous != text:
@@ -354,7 +410,11 @@ def extract_tex_project(entrypoint: str | Path) -> dict:
     else:
         abstract_text = None
 
-    blocks = _section_blocks(raw)
+    # Section boundaries must be read from prose, not from the preamble: a
+    # heading inside a macro definition or a code listing otherwise registers
+    # as a real section and silently mis-assigns the text that follows it.
+    scanned = _strip_definitions(_strip_environments(raw))
+    blocks = _section_blocks(scanned)
     introduction = _pick(blocks, _INTRO_EXACT, _INTRO_PREFIX)
     conclusion = _pick(blocks, _CONCLUSION_EXACT, _CONCLUSION_PREFIX)
     discussion = _pick(blocks, _DISCUSSION_EXACT, _DISCUSSION_PREFIX)
