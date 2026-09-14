@@ -4,9 +4,9 @@ This file records decisions and verified milestones. It is not a substitute for 
 
 ## Current status
 
-**Phase:** Ingestion pilot — LaTeX parser defects 1–3 fixed and verified  
-**Next action:** Fix defects 4–7 under "Review findings" below, then the quality gate and token measurements, then the PDF fallback route  
-**Overall status:** In progress — parser usable for the pilot; defects 4–7 and the PDF route remain
+**Phase:** Ingestion pilot — defects 1–3 and 7 fixed and verified; corpus at 30 papers  
+**Next action:** Fix defects 4–6 under "Review findings" below, then the quality gate and token measurements, then the PDF fallback route  
+**Overall status:** In progress — extraction no longer drops macro-defined names; defects 4–6 and the PDF route remain
 
 ## Decisions locked so far
 
@@ -109,6 +109,7 @@ This file records decisions and verified milestones. It is not a substitute for 
 | 2026-09-12 | Ingestion pilot | `tools/parser_probes.py` 16/16; `tools/corpus_quality_check.py` over 18 real arXiv sources: title/abstract/conclusion 100%, intro 94% (one paper's intro is commented out upstream), TeX-artifact residue 0% | LaTeX parser accepted; PDF fallback and quality gate are next |
 | 2026-09-13 | Review | Independent review subagent re-ran the suite (27 tests, 9 subtests), the probes (16/16) and the corpus harness; reproduced 3 silent-corruption defects | Parser accepted with defects open; see "Review findings" |
 | 2026-09-13 | Fix | Defects 1–3 fixed tests-first (27 → 30 tests). Follow-up review found the defect-3 fix had over-reached and deleted prose after `\label`; scoped to citations (31 tests) | Corpus diff 1/29, an improvement; defects 4–7 open |
+| 2026-09-14 | Corpus + Fix | Added 2606.19348 (30 papers). Fixed defect 7 (text macros inlined, not deleted) and three latent regressions it introduced (34 → 37 tests) | 22 fields restored over 30 papers; 0 field changes from the follow-up fixes |
 
 ## Review findings — parser hardening (2026-09-13)
 
@@ -142,14 +143,34 @@ Also confirmed: PyMuPDF is not installed, so the PDF route **raises `RuntimeErro
 
 ### Resolution (2026-09-13)
 
-Defects 1–3 are fixed and verified. Defects 4–7 and the PDF route are still open.
+Defects 1–3 and 7 are fixed and verified. Defects 4–6 and the PDF route are still open.
 
 | # | Status |
 |---|---|
 | 1 | Fixed — `_strip_definitions` reads macro bodies with a bracket scanner |
 | 2 | Fixed — environments are stripped before the heading scan |
 | 3 | Fixed — `_TWO_GROUP_CITE_RE` drops a citation's second mandatory group |
-| 4–7 | Open |
+| 7 | Fixed — zero-argument text macros are inlined instead of deleted |
+| 4–6 | Open |
+
+### Defect 7 — macro deletion (2026-09-14)
+
+Found by running the parser on arXiv 2606.19348 (now cached as
+`data/cache/arXiv-2606.19348v1`). The paper defines its model names as macros
+(`\newcommand{\dsviv}{DeepSeek-V4}`); every unknown macro was being deleted, so
+the title and abstract lost the model name and all parameter counts with **no
+warning** — the fields were still non-empty, so no automatic metric could see it.
+
+`_collect_macros` now builds a table of zero-argument definitions and
+`_expand_macros` inlines them. Three follow-up review findings were fixed in turn:
+expansion must run *before* environment stripping (a body can introduce a dropped
+environment); bodies holding counter/environment commands are structural and are
+not collected; and the table must be built from environment-stripped source so a
+`\newcommand` shown inside a code listing is not harvested.
+
+Corpus diff over 30 papers: 22 fields restored, 4 titles losing only a stray
+backslash, 0 section-resolution changes, and 0 field changes attributable to the
+three follow-up fixes.
 
 The first attempt at defect 3 added the second group to the *shared* drop regex,
 so it applied to every drop-command. `\label{key}{prose}` then deleted the prose,
