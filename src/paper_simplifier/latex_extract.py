@@ -94,11 +94,16 @@ _DROP_COMMAND_WITH_ARG_RE = re.compile(
     r"vspace|hspace|vskip|hskip|smallskip|medskip|bigskip|"
     r"index|glossary|hypersetup|geometry|captionsetup|graphicspath|"
     r"usepackage|documentclass|includegraphics|setlength|addtolength)"
-    r"\s*(?:\[[^\]]*\])*\s*\{[^{}]*\}(?:\{[^{}]*\})?"
+    r"\s*(?:\[[^\]]*\])*\s*\{[^{}]*\}"
 )
-# The trailing optional group swallows a second, immediately adjacent mandatory
-# argument (``\\citep{key}{postnote}``). It is deliberately space-sensitive:
-# ``\\cite{key} {prose}`` keeps its prose.
+# Citation commands alone may take a second, immediately adjacent mandatory
+# argument (``\\citep{key}{postnote}``). This is a separate rule on purpose: a
+# second-group allowance on the general drop list above also swallowed the
+# prose after ``\\label{key}``, ``\\footnote{key}`` and friends, which silently
+# deleted real sentences from corpus abstracts.
+_TWO_GROUP_CITE_RE = re.compile(
+    r"\\cite[a-zA-Z]*\s*(?:\[[^\]]*\])*\s*\{[^{}]*\}(?:\{[^{}]*\})?"
+)
 _TWO_ARG_UNWRAP_RE = re.compile(
     r"\\(?:href|textcolor|colorbox|texorpdfstring|pdftooltip)"
     r"\s*\{[^{}]*\}\s*\{([^{}]*)\}"
@@ -322,6 +327,9 @@ def _unwrap_commands(text: str) -> str:
         previous = text
         text = _DEFINITION_RE.sub("", text)
         text = _PLAIN_DEF_RE.sub("", text)
+        # Must precede the general drop rule, which would otherwise consume
+        # only the first group and leave the second as stray prose.
+        text = _TWO_GROUP_CITE_RE.sub("", text)
         text = _DROP_COMMAND_WITH_ARG_RE.sub("", text)
         text = _TWO_ARG_UNWRAP_RE.sub(r"\1", text)
         text = _ONE_ARG_UNWRAP_RE.sub(r"\1", text)

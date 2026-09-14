@@ -314,5 +314,22 @@ Discussion text.""",
         self.assertNotIn("smith2020", record["introduction"])
 
 
+    def test_only_citation_commands_drop_a_second_adjacent_group(self):
+        """A non-citation command must not swallow a following braced group.
+
+        Regression guard: an earlier fix let the second-group rule apply to
+        every command in the drop list, so \\label{key}{real prose} deleted the
+        prose. Real corpus papers lost abstract sentences to this.
+        """
+        self.assertEqual(
+            normalize_tex_text(r"see \label{eq:1}{REAL PROSE} here"),
+            "see REAL PROSE here",
+        )
+        self.assertEqual(
+            normalize_tex_text(r"note \footnote{a}{REAL PROSE} end"),
+            "note REAL PROSE end",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
