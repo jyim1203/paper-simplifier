@@ -129,6 +129,14 @@ _DEFINITION_HEAD_RE = re.compile(
     r"|\\def\b(?=\s*\\[a-zA-Z@])"
 )
 
+# Bodies that produce a value or a structure rather than prose. Inlining one
+# of these leaves residue once the inner command is dropped
+# (``S\\arabic{section}`` becomes a stray "S section"), or reintroduces an
+# environment that was already stripped.
+_STRUCTURAL_BODY_RE = re.compile(
+    r"\\(?:arabic|roman|Roman|alph|Alph|fnsymbol|value|number|begin|end)\b"
+)
+
 # --- math and escaping ------------------------------------------------------
 
 _MATH_DISPLAY_RE = re.compile(r"\$\$.*?\$\$|\\\[.*?\\\]|\\\(.*?\\\)", re.DOTALL)
@@ -399,7 +407,7 @@ def _collect_macros(text: str) -> dict[str, str]:
     """
     macros: dict[str, str] = {}
     for name, argument_count, body in _iter_definitions(text):
-        if argument_count:
+        if argument_count or _STRUCTURAL_BODY_RE.search(body):
             continue
         macros[name] = body
     return macros
@@ -441,8 +449,10 @@ def _unwrap_commands(text: str) -> str:
 def normalize_tex_text(text: str, macros: dict[str, str] | None = None) -> str:
     """Turn common TeX prose into readable plain text without claiming perfect fidelity."""
     text = _COMMENT_RE.sub("", text)
-    text = _strip_environments(text)
+    # Expand first: a macro body can itself introduce an environment, and that
+    # environment still has to be dropped by the strip that follows.
     text = _expand_macros(text, macros or {})
+    text = _strip_environments(text)
     # Protect escaped dollars so inline-math pairing cannot swallow prose.
     text = text.replace("\\$", _DOLLAR_SENTINEL)
     text = _MATH_DISPLAY_RE.sub(" ", text)
@@ -515,8 +525,9 @@ def extract_tex_project(entrypoint: str | Path) -> dict:
     raw, warnings = load_tex_project(entrypoint)
     raw = re.sub(r"\\end\{document\}.*$", "", raw, flags=re.DOTALL)
     # Definitions are removed before section scanning, so the macro table has to
-    # be built from the raw source while the definitions are still present.
-    macros = _collect_macros(raw)
+    # be built while they are still present. Environments are stripped first so a
+    # \\newcommand shown inside a code listing is not taken for a real definition.
+    macros = _collect_macros(_strip_environments(raw))
 
     title_text = _balanced_argument(raw, "title")
     abstract_env = _ABSTRACT_ENV_RE.search(raw)

@@ -394,5 +394,64 @@ Discussion text.""",
         self.assertIn("Towards Efficiency", normalized)
 
 
+    def test_macro_body_wrapping_a_dropped_environment_does_not_leak(self):
+        """An environment introduced by a macro body must still be stripped.
+
+        Expansion runs before environment stripping for this reason: otherwise
+        \\myfig -> \\begin{figure}...\\end{figure} never gets removed and visual
+        content leaks into prose (and into the title).
+        """
+        main = (
+            "\\documentclass{article}\n"
+            "\\newcommand{\\myfig}{\\begin{figure}\\caption{SECRETCAP}\\end{figure}}\n"
+            "\\title{A Test Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\section{{Introduction}}\n{PROSE} See \\myfig{{}} now.\n"
+            f"\\section{{Conclusion}}\n{PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertNotIn("SECRETCAP", record["introduction"])
+        self.assertNotIn("SECRETCAP", record["title"])
+
+    def test_counter_macro_is_not_inlined_into_prose(self):
+        """A counter macro body is structural, not text; inlining it leaves junk.
+
+        \\thesection -> S\\arabic{section} expands to 'S' once \\arabic is deleted,
+        so prose reads 'Section S section' where deleting the macro was correct.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {
+                "main.tex": full_doc(
+                    "\\renewcommand{\\thesection}{S\\arabic{section}}\n"
+                    f"\\section{{Introduction}}\n{PROSE} As shown in Section "
+                    "\\thesection{} we see.\n"
+                    f"\\section{{Conclusion}}\n{PROSE}"
+                ),
+            })
+            record = extract_tex_project(root / "main.tex")
+        self.assertNotIn("S section", record["introduction"])
+
+    def test_definition_inside_verbatim_is_not_harvested(self):
+        """A \\newcommand shown inside a code listing is not a real definition."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {
+                "main.tex": full_doc(
+                    "\\begin{verbatim}\n\\newcommand{\\cmdone}{RESIDUE}\n"
+                    "\\end{verbatim}\n"
+                    f"\\section{{Introduction}}\n{PROSE} See \\cmdone{{}} now.\n"
+                    f"\\section{{Conclusion}}\n{PROSE}"
+                ),
+            })
+            record = extract_tex_project(root / "main.tex")
+        self.assertNotIn("RESIDUE", record["introduction"])
+
+
 if __name__ == "__main__":
     unittest.main()
