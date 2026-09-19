@@ -12,6 +12,13 @@ Design notes (each corresponds to a failure mode observed on real arXiv sources)
   titles (``\\section[Short]{Long}``) and nested macros in a heading still
   register as boundaries. A heading that fails to register silently merges two
   sections together, which is the most damaging failure in this pipeline.
+- Chapter documents are split on ``\\chapter`` first, because a ``\\section``
+  inside a chapter is a subsection: preferring ``\\section`` on any match makes
+  an inner ``\\section{Background}`` answer for the introduction and loses the
+  chapter-level Conclusion. The section split is still consulted for any field
+  the chapter split does not supply, so a document that merely *mentions* a
+  chapter (an appendix, a part divider, dead code) keeps the introduction and
+  conclusion that its section headings describe.
 - Section names are matched on normalized prefixes, so ``Conclusion and Future
   Work`` is a conclusion and not a missing section.
 - Every miss is recorded as a warning instead of returning a damaged section
@@ -24,7 +31,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 
 _INPUT_RE = re.compile(r"\\(?:input|include)\s*\{([^}]+)\}")
@@ -39,15 +46,58 @@ _BRACE_RE = re.compile(r"[{}]")
 
 _SECTION_CMD_RE = re.compile(r"\\section\*?\s*(?:\[[^\]]*\])?\s*\{")
 _CHAPTER_CMD_RE = re.compile(r"\\chapter\*?\s*(?:\[[^\]]*\])?\s*\{")
+_SUBSECTION_CMD_RE = re.compile(r"\\subsection\*?\s*(?:\[[^\]]*\])?\s*\{")
+_SUBSUBSECTION_CMD_RE = re.compile(r"\\subsubsection\*?\s*(?:\[[^\]]*\])?\s*\{")
+def _guarded(pattern: re.Pattern[str]) -> re.Pattern[str]:
+    r"""A heading pattern that will not match displayed text.
+
+    ``\texttt{\subsection{X}}`` and ``\verb|\subsection{X}|`` show the command
+    as an example rather than starting a section; there the command is preceded by
+    ``{`` or ``|``. Stripping those would delete a word from a real sentence.
+    """
+    return re.compile(r"(?<![{\\|])" + pattern.pattern)
+
+
+# Headings *below* each split's own level, plus any heading that is not a boundary
+# for that split at all (a ``\chapter`` inside a section-split document is not a
+# boundary, so its title is residue). Each is removed together with its title when
+# a block body is read, so a heading's name cannot pass for that block's prose.
+# Only headings *below* the split's own level are stripped. ``\paragraph`` and
+# ``\subparagraph`` are deliberately left alone -- real papers give them
+# sentence-shaped titles ("The attribution helps establish trust, debug failure
+# modes, ...") so removing them deletes prose -- and a ``\chapter`` inside a
+# section-split document keeps its title too, because stripping it emptied 14
+# further fields whose only text was that title (7 -> 21 field losses in the
+# 600-doc fuzzer) for no gain the review asked for.
+_SECTION_CHILD_HEADING_RES = tuple(
+    _guarded(pattern)
+    for pattern in (_SUBSECTION_CMD_RE, _SUBSUBSECTION_CMD_RE)
+)
+_CHAPTER_CHILD_HEADING_RES = tuple(
+    _guarded(pattern)
+    for pattern in (_SECTION_CMD_RE, _SUBSECTION_CMD_RE, _SUBSUBSECTION_CMD_RE)
+)
 _HEADING_NOISE_RE = re.compile(r"[\s\u00a0]+")
 _HEADING_LEAD_NUMBER_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*|[IVXLC]+)[.)]?\s+", re.IGNORECASE)
 
-_INTRO_EXACT = {"introduction", "background", "motivation", "overview"}
-_INTRO_PREFIX = ("introduction", "background")
-_CONCLUSION_EXACT = {"conclusion", "conclusions", "summary"}
-_CONCLUSION_PREFIX = ("conclusion", "concluding")
-_DISCUSSION_EXACT = {"discussion", "discussions"}
-_DISCUSSION_PREFIX = ("discussion",)
+# Heading names in tiers, strongest first. Every candidate split is searched for
+# a tier's names before the next, weaker tier is considered, and only then is the
+# next split consulted. Ranking by split first let a weak alias win on document
+# structure alone: a chapter-level ``\chapter{Background}`` took the introduction
+# slot from a real ``\section{Introduction}``, and a ``\chapter{Summary}`` took the
+# conclusion slot from a ``\section{Conclusion}``, discarding the real section's
+# prose while every field stayed non-empty.
+_INTRO_TIERS = (
+    (frozenset({"introduction"}), ("introduction",)),
+    (frozenset({"background", "motivation", "overview"}), ("background",)),
+)
+_CONCLUSION_TIERS = (
+    (frozenset({"conclusion", "conclusions"}), ("conclusion", "concluding")),
+    (frozenset({"summary"}), ("summary",)),
+)
+_DISCUSSION_TIERS = (
+    (frozenset({"discussion", "discussions"}), ("discussion",)),
+)
 
 # --- input resolution -------------------------------------------------------
 
@@ -144,7 +194,17 @@ _MATH_INLINE_RE = re.compile(r"\$[^$\n]*\$")
 _DOLLAR_SENTINEL = "\x00DOLLAR\x00"
 _THIN_SPACE_RE = re.compile(r"\\[,;:! ]")
 _LINE_BREAK_RE = re.compile(r"\\\\")
-_ESCAPED_CHAR_RE = re.compile(r"\\([_%&#])")
+# Everything still carrying a backslash once _COMMAND_RE has removed every
+# \word command is a one-character escape (\% \_ \{ \} \" \' \|) or a stray
+# backslash before a newline. The whitelist this replaces listed only [_%&#],
+# so escaped braces and accents reached the corpus as residue -- ``\{a, b\}``
+# rendered as ``\a, b\`` and ``H\"older`` kept its backslash -- with no warning.
+# The group is optional so a trailing lone backslash is dropped too. Collapsing
+# before the brace strip is not what fixes ``\{x\}`` -- the optional group
+# already covers that -- it matters for adjacent escapes split by braces:
+# ``a\{\}b`` collapses to ``ab`` here, but keeps a backslash (``a\b``) if the
+# brace strip runs first.
+_ESCAPED_CHAR_RE = re.compile(r"\\(.)?", re.DOTALL)
 
 
 def _candidate_path(base: Path, name: str) -> Path | None:
@@ -467,8 +527,9 @@ def normalize_tex_text(text: str, macros: dict[str, str] | None = None) -> str:
     text = _unwrap_commands(text)
     text = _ENV_COMMAND_RE.sub(" ", text)
     text = _COMMAND_RE.sub(" ", text)
-    text = _BRACE_RE.sub("", text)
+    # Escapes are collapsed before the brace strip; see _ESCAPED_CHAR_RE.
     text = _ESCAPED_CHAR_RE.sub(r"\1", text)
+    text = _BRACE_RE.sub("", text)
     lines = [" ".join(line.split()) for line in text.splitlines()]
     return "\n".join(line for line in lines if line).strip()
 
@@ -481,9 +542,49 @@ def _normalize_heading(title: str) -> str:
     return text.strip(" .,:;-–")
 
 
-def _section_blocks(text: str) -> list[tuple[str, str]]:
-    """Split on top-level headings, returning ``(title, body)`` pairs."""
-    pattern = _SECTION_CMD_RE if _SECTION_CMD_RE.search(text) else _CHAPTER_CMD_RE
+def _strip_headings(text: str, patterns: Iterable[re.Pattern[str]]) -> str:
+    r"""Remove heading commands *and their titles* from a block body.
+
+    A child heading's title is ordinary-looking text once commands and braces are
+    stripped, so ``\subsection*{Summary}`` survives normalization as the bare
+    word ``Summary``. That residue can be the only non-empty text in an otherwise
+    empty block, which lets the block win a field on name alone.
+
+    Deliberate consequence: a block whose body held nothing but such a title now
+    normalizes to empty and is rejected, so a field the older code filled with
+    residue (measured values: ``Conclusion``, ``Part II``, ``[Short]Background``,
+    ``Concluding remarks``) becomes empty and carries a not-found warning. That is
+    the better outcome -- a one-word field silently passing as content is worse
+    than an empty field the quality gate can reject.
+    """
+    for pattern in patterns:
+        pieces: list[str] = []
+        pos = 0
+        while True:
+            match = pattern.search(text, pos)
+            if match is None:
+                pieces.append(text[pos:])
+                break
+            pieces.append(text[pos : match.start()])
+            group = _balanced_group(text, match.end() - 1)
+            if group is None:
+                pos = match.end()
+                continue
+            # Leave a separator: without one the text either side of a removed
+            # heading is glued together ("clause.\subsection{X}Next" would lose
+            # the break) and two sentences merge into one word.
+            pieces.append(" ")
+            pos = group[1]
+        text = "".join(pieces)
+    return text
+
+
+def _section_blocks(text: str, pattern: re.Pattern[str]) -> list[tuple[str, str, int]]:
+    """Split on the given heading command, returning ``(title, body, start)``.
+
+    ``start`` is the heading's offset in the document, so callers can order
+    candidates by where they appear rather than by which split produced them.
+    """
     heads: list[tuple[str, int, int]] = []
     pos = 0
     while True:
@@ -497,27 +598,92 @@ def _section_blocks(text: str) -> list[tuple[str, str]]:
         title, body_start = group
         heads.append((title.strip(), match.start(), body_start))
         pos = body_start
-    blocks: list[tuple[str, str]] = []
-    for index, (title, _start, body_start) in enumerate(heads):
+    blocks: list[tuple[str, str, int]] = []
+    for index, (title, start, body_start) in enumerate(heads):
         stop = heads[index + 1][1] if index + 1 < len(heads) else len(text)
-        blocks.append((title, text[body_start:stop]))
+        blocks.append((title, text[body_start:stop], start))
     return blocks
 
 
-def _pick(
-    blocks: Iterable[tuple[str, str]],
-    exact: set[str],
-    prefixes: tuple[str, ...],
-) -> tuple[str, str] | None:
-    """Best heading match: normalized exact first, then normalized prefix."""
-    candidates = [(title, _normalize_heading(title), body) for title, body in blocks]
-    for title, normalized, body in candidates:
-        if normalized in exact:
-            return title, body
-    for title, normalized, body in candidates:
-        if normalized.startswith(prefixes):
-            return title, body
+def _resolve_field(
+    splits: Iterable[list[tuple[str, str, int]]],
+    tiers: Iterable[tuple[frozenset[str], tuple[str, ...]]],
+    normalize: Callable[[str], str],
+) -> tuple[str, str, str] | None:
+    r"""Resolve one narrative field as ``(heading, raw_body, text)``.
+
+    Candidates from every split are merged and ordered by position in the
+    document, so a heading cannot win merely by belonging to the preferred split:
+    the chapter split used to take precedence regardless of order, which let a
+    later ``\chapter{Introduction}`` displace an earlier
+    ``\section{Introduction}`` and silently drop that section's prose. Ties keep
+    split order, so the chapter reading still wins when both describe the same
+    heading.
+
+    Names are then ranked in tiers, strongest first, and inside a tier exact names
+    beat prefixes. A heading is only an answer if its body normalizes to something
+    non-empty: a bare ``\chapter{Conclusion}`` with nothing under it otherwise
+    matches by name and shadows the real section.
+
+    KNOWN LIMIT, verified by review: "non-empty" is not "prose". Residue that this
+    module does not strip -- ``\paragraph{Summary}``, ``\textbf{X}``,
+    ``\begin{center}``, ``\item[X]`` -- leaves a word or two behind, which is enough
+    to win a field on name alone while the paper's real prose leaves the record.
+    Reproducible with ``\paragraph{Summary}`` in place of a body. A content floor
+    fixes it but rejects genuinely short sections (field-loss docs rose 7 -> 21 in
+    the fuzzer), so the trade needs a decision rather than a quick threshold.
+
+    Accepted trade of the tiers: when a document offers a weaker name earlier and
+    a stronger one later -- ``\section{Summary}`` before ``\chapter{Conclusion}``
+    -- the stronger name wins and the earlier section's prose is not used. That is
+    the point of ranking (an aliased section is not the conclusion), and it is the
+    trade an independent review measured as net-beneficial: own-drop 57 with the
+    tiers versus 62 without, and 514 documents gained a field. 3 of 216
+    dead-code-free fuzzed documents still show it.
+    """
+    candidates: list[tuple[int, int, str, str]] = []
+    for split_index, blocks in enumerate(splits):
+        for title, body, start in blocks:
+            candidates.append((start, split_index, title, body))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    prepared = [
+        (title, _normalize_heading(title), body, normalize(body))
+        for _start, _split, title, body in candidates
+    ]
+    for exact, prefixes in tiers:
+        for title, normalized, body, text in prepared:
+            if text and normalized in exact:
+                return title, body, text
+        for title, normalized, body, text in prepared:
+            if text and normalized.startswith(prefixes):
+                return title, body, text
     return None
+
+
+def _block_splits(text: str) -> list[list[tuple[str, str, int]]]:
+    r"""Candidate block splits, chapter level first.
+
+    ``\chapter`` is the top level in book/report classes and ``\section`` is a
+    *subsection* of it, so the chapter split is the more authoritative reading and
+    is listed first. But a document may only *mention* a chapter -- an appendix
+    after ``ppendix``, a lone ``\chapter{Part II}`` divider, or a ``\chapter``
+    leaked out of ``\iffalse`` dead code -- and resolve nothing at that level, so
+    the section split is offered as well. ``_resolve_field`` chooses between them
+    per field, by document position, then by heading name.
+
+    Each body has its child headings stripped, titles included: a child heading's
+    title is prose-looking text once commands and braces are gone, and on its own
+    it would let a block with no real prose win a field.
+    """
+    chapter = [
+        (title, _strip_headings(body, _CHAPTER_CHILD_HEADING_RES), start)
+        for title, body, start in _section_blocks(text, _CHAPTER_CMD_RE)
+    ]
+    section = [
+        (title, _strip_headings(body, _SECTION_CHILD_HEADING_RES), start)
+        for title, body, start in _section_blocks(text, _SECTION_CMD_RE)
+    ]
+    return [chapter, section]
 
 
 def extract_tex_project(entrypoint: str | Path) -> dict:
@@ -542,21 +708,30 @@ def extract_tex_project(entrypoint: str | Path) -> dict:
     # heading inside a macro definition or a code listing otherwise registers
     # as a real section and silently mis-assigns the text that follows it.
     scanned = _strip_definitions(_strip_environments(raw))
-    blocks = _section_blocks(scanned)
-    introduction = _pick(blocks, _INTRO_EXACT, _INTRO_PREFIX)
-    conclusion = _pick(blocks, _CONCLUSION_EXACT, _CONCLUSION_PREFIX)
-    discussion = _pick(blocks, _DISCUSSION_EXACT, _DISCUSSION_PREFIX)
+    splits = _block_splits(scanned)
+
+    def normalize_body(body: str) -> str:
+        return normalize_tex_text(body, macros)
+
+    introduction = _resolve_field(splits, _INTRO_TIERS, normalize_body)
+    conclusion = _resolve_field(splits, _CONCLUSION_TIERS, normalize_body)
+    # Discussion is only a fallback: resolving it unconditionally would waste a
+    # normalization pass over every block of both splits.
+    discussion = (
+        None
+        if conclusion is not None
+        else _resolve_field(splits, _DISCUSSION_TIERS, normalize_body)
+    )
 
     title = normalize_tex_text(title_text, macros) if title_text else ""
     abstract = normalize_tex_text(abstract_text, macros) if abstract_text else ""
-    intro_body = normalize_tex_text(introduction[1], macros) if introduction else ""
+    intro_body = introduction[2] if introduction else ""
     conclusion_source = (
         conclusion[0] if conclusion else discussion[0] if discussion else None
     )
-    conclusion_body = (
-        conclusion[1] if conclusion else discussion[1] if discussion else ""
+    conclusion_text = (
+        conclusion[2] if conclusion else discussion[2] if discussion else ""
     )
-    conclusion_text = normalize_tex_text(conclusion_body, macros)
 
     if not title:
         warnings.append("title_not_found")

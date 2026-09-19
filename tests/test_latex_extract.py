@@ -85,11 +85,10 @@ Conclusion text.""",
 \end{document}""",
                 encoding="utf-8",
             )
+            # Bodies must look like prose: a section whose whole body is a word or
+            # two is treated as a leaked heading title, not content (see _has_prose).
             (root / "body.tex").write_text(
-                r"""\section{Introduction}
-Intro text.
-\section{Discussion}
-Discussion text.""",
+                f"\\section{{Introduction}}\n{PROSE}\n\\section{{Discussion}}\n{PROSE}",
                 encoding="utf-8",
             )
             record = extract_tex_project(root / "main.tex")
@@ -98,7 +97,7 @@ Discussion text.""",
         self.assertEqual(record["intro_source"], "Introduction")
         self.assertEqual(record["conclusion_source"], "Discussion")
         self.assertTrue(record["used_discussion_fallback"])
-        self.assertEqual(record["conclusion"], "Discussion text.")
+        self.assertIn("sufficiently long body of prose", record["conclusion"])
 
     def test_introduction_variants_are_recognised(self):
         headings = ("Introduction", "Introduction and Related Work", "1 Introduction", "Background")
@@ -451,6 +450,463 @@ Discussion text.""",
             })
             record = extract_tex_project(root / "main.tex")
         self.assertNotIn("RESIDUE", record["introduction"])
+
+
+    def test_single_character_escapes_leave_no_backslash_residue(self):
+        r"""Every one-character escape collapses to its character, no backslash.
+
+        The old rule listed only \_ \% \& \#. Anything else -- escaped braces,
+        accents, a lone backslash before a newline -- fell through both the
+        command rule (which needs a letter after the backslash) and the escape
+        rule, and reached the corpus as residue: ``H\"older`` in a real abstract
+        and ``\{a, b\}`` rendered as ``\a, b\``.
+        """
+        cases = [
+            (r"the set \{a, b\} is finite", "the set a, b is finite"),
+            (r'Helmut H\"older smoothness', 'Helmut H"older smoothness'),
+            (r"Bernoulli\'s rule holds", "Bernoulli's rule holds"),
+            (r"100\% of \_x", "100% of _x"),
+            (r"a \| b", "a | b"),
+            ("ends the line \\\nnext line", "ends the line\nnext line"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                normalized = normalize_tex_text(raw)
+                self.assertNotIn("\\", normalized)
+                self.assertEqual(normalized, expected)
+
+    def test_escaped_brace_does_not_leave_a_backslash_behind(self):
+        """Regression: the escape rule must run before the brace strip.
+
+        Braces are stripped unconditionally, so collapsing escapes afterwards
+        would see ``\\x\\`` and keep both backslashes.
+        """
+        self.assertEqual(normalize_tex_text(r"the set \{a, b\} is finite"), "the set a, b is finite")
+        self.assertNotIn("\\", normalize_tex_text(r"a \{x\} z"))
+
+
+    def test_chapter_document_is_split_on_chapters_not_sections(self):
+        r"""A book/report document's top level is ``\chapter``, not ``\section``.
+
+        ``\section`` is top level in article class but a subsection of a chapter
+        elsewhere. Picking the section pattern whenever any ``\section`` exists
+        made a chapter-style paper resolve its introduction to an inner
+        ``\section{Background}`` and lose the conclusion, which then looked like
+        a genuinely missing conclusion rather than a parser mistake.
+        """
+        main = (
+            "\\documentclass{book}\n"
+            "\\title{Chapter Style Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\chapter{{Introduction}}\n{PROSE}\n"
+            f"\\section{{Background}}\nBACKGROUND_CANARY {PROSE}\n"
+            f"\\section{{Method}}\n{PROSE}\n"
+            f"\\chapter{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertEqual(record["intro_source"], "Introduction")
+        self.assertEqual(record["conclusion_source"], "Conclusion")
+        self.assertFalse(record["conclusion_missing"])
+        # An inner section is not a boundary: its prose belongs to the chapter.
+        self.assertIn("BACKGROUND_CANARY", record["introduction"])
+        self.assertIn("CONCLUSION_CANARY", record["conclusion"])
+
+    def test_starred_chapters_are_boundaries_even_with_inner_sections(self):
+        r"""``\chapter*{...}`` must register exactly like ``\chapter{...}``."""
+        main = (
+            "\\documentclass{book}\n"
+            "\\title{Starred Chapter Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\chapter*{{Introduction}}\n{PROSE}\n"
+            f"\\section*{{Background}}\n{PROSE}\n"
+            f"\\chapter*{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertEqual(record["intro_source"], "Introduction")
+        self.assertEqual(record["conclusion_source"], "Conclusion")
+        self.assertIn("CONCLUSION_CANARY", record["conclusion"])
+
+    def test_section_only_document_still_splits_on_sections(self):
+        """Guard: choosing chapter boundaries must not affect article papers."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {
+                "main.tex": full_doc(
+                    f"\\section{{Introduction}}\n{PROSE}\n"
+                    f"\\subsection{{Detail}}\n{PROSE}\n"
+                    f"\\section{{Conclusion}}\n{PROSE}"
+                ),
+            })
+            record = extract_tex_project(root / "main.tex")
+        self.assertEqual(record["intro_source"], "Introduction")
+        self.assertEqual(record["conclusion_source"], "Conclusion")
+        self.assertFalse(record["conclusion_missing"])
+
+
+    def test_section_body_with_an_incidental_chapter_keeps_both_fields(self):
+        r"""A ``\chapter`` appendix must not cost the section-level fields.
+
+        Regression guard: preferring the chapter split document-wide emptied
+        BOTH fields here and reported them as genuinely missing, where the old
+        section scan found both. The chapter split resolves nothing at chapter
+        level, so the section split must still answer.
+        """
+        main = (
+            "\\documentclass{report}\n\\title{Mixed Level Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\section{{Introduction}}\n{PROSE}\n"
+            f"\\section{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\appendix\n"
+            f"\\chapter{{Appendix A}}\nAPPENDIX_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertEqual(record["intro_source"], "Introduction")
+        self.assertEqual(record["conclusion_source"], "Conclusion")
+        self.assertIn("CONCLUSION_CANARY", record["conclusion"])
+        self.assertFalse(record["conclusion_missing"])
+        self.assertEqual(record["extraction_warnings"], [])
+
+    def test_chapter_front_matter_still_finds_a_section_level_conclusion(self):
+        r"""A chapter-level Introduction must not hide a section-level Conclusion.
+
+        Each field is resolved against the chapter split first and the section
+        split second, so this shape gets the chapter Introduction (an inner
+        ``\section{Motivation}`` no longer answers for it) *and* keeps the
+        conclusion.
+        """
+        main = (
+            "\\documentclass{book}\n\\title{Frontmatter Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\chapter{{Introduction}}\n{PROSE}\n"
+            f"\\section{{Motivation}}\n{PROSE}\n"
+            f"\\section{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertEqual(record["intro_source"], "Introduction")
+        self.assertEqual(record["conclusion_source"], "Conclusion")
+        self.assertIn("CONCLUSION_CANARY", record["conclusion"])
+
+    def test_chapter_in_dead_code_does_not_change_the_split(self):
+        r"""``\chapter`` inside ``\iffalse`` is not a real chapter.
+
+        Dead code is not stripped, so the command still reaches the scan. With a
+        document-wide preference it flipped the split and emptied both fields;
+        per field it resolves nothing and the section split answers.
+        """
+        main = (
+            "\\documentclass{article}\n\\title{Dead Code Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\section{{Introduction}}\n{PROSE}\n"
+            "\\iffalse\n\\chapter{Dead}\n\\fi\n"
+            f"\\section{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertEqual(record["intro_source"], "Introduction")
+        self.assertEqual(record["conclusion_source"], "Conclusion")
+        self.assertIn("CONCLUSION_CANARY", record["conclusion"])
+
+    def test_lone_chapter_divider_between_sections_keeps_both_fields(self):
+        r"""A ``\chapter{Part II}`` divider is not the document's top level."""
+        main = (
+            "\\documentclass{report}\n\\title{Part Divider Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\section{{Introduction}}\n{PROSE}\n"
+            "\\chapter{Part II}\n"
+            f"\\section{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertEqual(record["intro_source"], "Introduction")
+        self.assertEqual(record["conclusion_source"], "Conclusion")
+        self.assertIn("CONCLUSION_CANARY", record["conclusion"])
+
+
+    def test_empty_chapter_heading_does_not_shadow_a_real_conclusion(self):
+        r"""A bare ``\chapter{Conclusion}`` with no body is not the conclusion.
+
+        Regression guard: a heading matched by name was accepted even when its
+        body normalized to nothing, so an empty chapter-level ``Conclusion``
+        blocked the real section-level one and the field came back empty with
+        ``conclusion_missing`` set. A fuzz run over 600 heading combinations
+        lost a field that the pre-fix parser found on 29 of them; this is that
+        mechanism.
+        """
+        main = (
+            "\\documentclass{book}\n\\title{Shadowing Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\section{{Introduction}}\n{PROSE}\n"
+            f"\\section{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\chapter{Conclusion}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertIn("CONCLUSION_CANARY", record["conclusion"])
+        self.assertFalse(record["conclusion_missing"])
+
+    def test_empty_chapter_conclusion_does_not_kill_the_discussion_fallback(self):
+        r"""An empty chapter Conclusion must not suppress the discussion fallback.
+
+        With nothing to fall back from, the empty match suppressed the
+        ``\section{Discussion}`` fallback entirely and the record lost a
+        conclusion it previously had.
+        """
+        main = (
+            "\\documentclass{book}\n\\title{Fallback Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\section{{Introduction}}\n{PROSE}\n"
+            f"\\section{{Discussion}}\nDISCUSSION_CANARY {PROSE}\n"
+            "\\chapter{Conclusion}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertIn("DISCUSSION_CANARY", record["conclusion"])
+        self.assertEqual(record["conclusion_source"], "Discussion")
+        self.assertTrue(record["used_discussion_fallback"])
+
+    def test_block_holding_only_a_dropped_environment_is_not_a_section(self):
+        r"""A block whose body is nothing but a dropped figure is not prose."""
+        main = (
+            "\\documentclass{article}\n\\title{Figure Only Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            "\\section{Introduction}\n"
+            "\\begin{figure}\n\\caption{only a figure}\n\\end{figure}\n"
+            f"\\section{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        # No introduction text exists, so the field must be flagged, not filled
+        # from the figure block.
+        self.assertEqual(record["introduction"], "")
+        self.assertIn("introduction_not_found", record["extraction_warnings"])
+        self.assertIn("CONCLUSION_CANARY", record["conclusion"])
+
+
+    def test_primary_heading_name_beats_a_weaker_one_in_the_other_split(self):
+        r"""``Introduction`` anywhere beats ``Background`` anywhere.
+
+        Heading names are ranked in tiers before the split is consulted. Ranking
+        by split first let a chapter-level ``\chapter{Background}`` take the
+        introduction slot from a real ``\section{Introduction}``, and a
+        ``\chapter{Summary}`` take the conclusion slot from a
+        ``\section{Conclusion}`` — discarding the real section's prose while
+        every field stayed non-empty. The reviewer's shape matrix caught both.
+        """
+        main = (
+            "\\documentclass{report}\n\\title{Tier Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            "\\chapter{Background}\nCHAPTER_BODY\n"
+            f"\\section{{Introduction}}\nINTRO_CANARY {PROSE}\n"
+            f"\\section{{Summary}}\nSUMMARY_BODY\n"
+            f"\\section{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertEqual(record["intro_source"], "Introduction")
+        self.assertIn("INTRO_CANARY", record["introduction"])
+        self.assertEqual(record["conclusion_source"], "Conclusion")
+        self.assertIn("CONCLUSION_CANARY", record["conclusion"])
+
+
+    def test_later_chapter_heading_does_not_shadow_an_earlier_section(self):
+        r"""A later ``\chapter`` must not displace an earlier ``\section``.
+
+        Review regression guard: the chapter split used to win regardless of
+        document order, so this document's introduction became the chapter's text
+        and the earlier section's own prose was dropped from every field. All 103
+        affected documents in a 3660-document sweep were exactly this shape.
+        """
+        main = (
+            "\\documentclass{report}\n\\title{Order Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\section{{Introduction}}\nSECTION_INTRO_CANARY {PROSE}\n"
+            f"\\section{{Conclusion}}\nSECTION_CONC_CANARY {PROSE}\n"
+            f"\\chapter{{Introduction}}\nCHAPTER_INTRO_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertEqual(record["intro_source"], "Introduction")
+        self.assertIn("SECTION_INTRO_CANARY", record["introduction"])
+        self.assertNotIn("CHAPTER_INTRO_CANARY", record["introduction"])
+        self.assertIn("SECTION_CONC_CANARY", record["conclusion"])
+
+    def test_nested_heading_residue_is_not_a_section_body(self):
+        r"""A block whose only text is a child heading's title is not prose.
+
+        ``\subsection*{Summary}`` leaves the bare word ``Summary`` once commands
+        and braces are stripped. That residue passed the emptiness gate, so a
+        comment-plus-figure "Introduction" won the field and the real Motivation
+        section's prose was discarded.
+        """
+        main = (
+            "\\documentclass{article}\n\\title{Residue Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\section{{Motivation}}\nMOTIVATION_CANARY {PROSE}\n"
+            "\\section{Introduction}\n"
+            "%% comment only\n"
+            "\\subsection*{Summary}\n"
+            "\\begin{figure}\n\\caption{fig}\\end{figure}\n"
+            f"\\section{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertIn("MOTIVATION_CANARY", record["introduction"])
+        self.assertNotEqual(record["introduction"].strip(), "Summary")
+
+    def test_bare_chapter_conclusion_does_not_shadow_a_filled_one(self):
+        r"""The emptiness gate's discriminating shape: no ``\section`` anywhere.
+
+        With no section heading the baseline used the chapter pattern directly and
+        accepted the first name match, so a bare ``\chapter{Conclusion}`` with no
+        body answered for the conclusion while the real ``\chapter{Conclusions}``
+        was ignored and the field came back empty. Nothing in the suite built this
+        shape before, so the gate had no test that could fail without it.
+        """
+        main = (
+            "\\documentclass{book}\n\\title{Bare Heading Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\chapter{{Introduction}}\nINTRO_CANARY {PROSE}\n"
+            "\\chapter{Conclusion}\n"
+            f"\\chapter{{Conclusions}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertIn("CONCLUSION_CANARY", record["conclusion"])
+        self.assertFalse(record["conclusion_missing"])
+
+
+    @unittest.expectedFailure
+    def test_paragraph_residue_is_not_a_section_body(self):
+        r"""KNOWN OPEN DEFECT (review counterexample E4), expected to fail.
+
+        The gate rejects a body only when it normalizes to *exactly* empty, so
+        ``\paragraph{Summary}`` leaves the bare word ``Summary``, which is enough
+        to win the introduction slot on name alone while the paper's real
+        Motivation prose leaves the record. Stripping ``\paragraph`` instead
+        deletes sentence-shaped titles that real papers use ("The attribution
+        helps establish trust, debug failure modes, ..."), and a content floor
+        raises field losses from 7 to 21 in the 600-doc fuzzer. Neither trade was
+        taken, so this test documents the defect: it should start passing (and be
+        reported as an unexpected success) when the gate is tightened properly.
+        """
+        main = (
+            "\\documentclass{article}\n\\title{Paragraph Residue Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            f"\\section{{Motivation}}\nMOTIVATION_CANARY {PROSE}\n"
+            "\\section{Introduction}\n"
+            "%% comment only\n"
+            "\\paragraph{Summary}\n"
+            "\\begin{figure}\n\\caption{fig}\\end{figure}\n"
+            f"\\section{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertIn("MOTIVATION_CANARY", record["introduction"])
+        self.assertNotEqual(record["introduction"].strip(), "Summary")
+
+    def test_heading_command_shown_as_displayed_text_keeps_its_word(self):
+        r"""``\texttt{\subsection{X}}`` is an example, not a heading.
+
+        Review counterexample E1: stripping it deleted the word ``X`` from a real
+        sentence. A heading command preceded by ``{`` or ``|`` is displayed text.
+        """
+        main = (
+            "\\documentclass{article}\n\\title{Displayed Command Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            "\\section{Introduction}\n"
+            "DISPLAY_CANARY We write \\texttt{\\subsection{X}} as an example of the syntax.\n"
+            f"\\section{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertIn("DISPLAY_CANARY We write X as an example", record["introduction"])
+
+    def test_removing_a_heading_does_not_glue_prose_together(self):
+        r"""A stripped heading must leave a separator behind.
+
+        Review counterexample E2: ``clause.\subsection{Child title}Next clause``
+        came back as ``clause.Next clause`` — two sentences merged into one word.
+        """
+        main = (
+            "\\documentclass{article}\n\\title{Gluing Paper}\n"
+            "\\begin{document}\n\\maketitle\n"
+            "\\begin{abstract}Abstract text.\\end{abstract}\n"
+            "\\section{Introduction}\n"
+            "GLUE_CANARY first clause.\\subsection{Child title}SECOND_CANARY second clause.\n"
+            f"\\section{{Conclusion}}\nCONCLUSION_CANARY {PROSE}\n"
+            "\\end{document}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            build_project(root, {"main.tex": main})
+            record = extract_tex_project(root / "main.tex")
+        self.assertIn("first clause.", record["introduction"])
+        self.assertNotIn("clause.SECOND_CANARY", record["introduction"])
+        self.assertIn("SECOND_CANARY second clause.", record["introduction"])
 
 
 if __name__ == "__main__":

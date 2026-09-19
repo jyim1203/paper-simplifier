@@ -46,6 +46,15 @@ NOISE_PATTERNS = {
     "backslash_command": re.compile(r"\\[a-zA-Z@]+"),
     "thin_space": re.compile(r"\\[,;!]"),
     "escaped_char": re.compile(r"\\[_%&#]"),
+    # Any backslash that does not start a \word command is residue: escaped
+    # braces, accents (\"), or a stray backslash before a newline. The old
+    # pattern list only knew \_ \% \& \# and \, \, so H\"older in a real
+    # abstract went unreported. The lookbehind plus the excluded characters keep
+    # this pattern disjoint from the other *backslash* patterns, so noise_total
+    # does not charge \\ to both this and double_backslash. \& is still counted
+    # twice, by this pattern's siblings: escaped_char and the character-level
+    # ampersand rule, which also fires on literal prose ampersands.
+    "stray_backslash": re.compile(r"(?<!\\)\\[^a-zA-Z@_%&#,;:!\\{}]"),
     "brace": re.compile(r"[{}]"),
     "double_backslash": re.compile(r"\\\\"),
     "ampersand": re.compile(r"&"),
@@ -65,22 +74,36 @@ FALLBACK_IDS = [
 
 
 def safe_extract(data: bytes, dest: Path) -> str:
-    """Extract an arXiv source payload: tarball, single gzipped .tex, or PDF."""
-    dest.mkdir(parents=True, exist_ok=True)
-    if data[:4] == b"%PDF":
-        raise ValueError("pdf_only_submission")
+    """Extract an arXiv source payload: tarball, single gzipped .tex, or PDF.
+
+    The tar attempt runs before any magic-byte test and before ``dest`` is
+    created, for two reasons: a tar stores its first member's NAME in its first
+    bytes, so ``data[:4] == b"%PDF"`` also matches a TeX tarball whose first
+    member is called ``%PDF_something.tex``; and a PDF-only payload must not
+    leave an empty ``src`` behind for the next cached-only run to take for a
+    source tree.
+    """
+    if not data:
+        raise ValueError("empty_source_payload")
     try:
         with tarfile.open(fileobj=io.BytesIO(data)) as tar:
             members = [m for m in tar.getmembers() if m.isfile()]
+            dest.mkdir(parents=True, exist_ok=True)
             tar.extractall(dest, members=members, filter="data")
         return f"tar({len(members)} files)"
     except tarfile.TarError:
         pass
+    if data[:4] == b"%PDF":
+        raise ValueError("pdf_only_submission")
     try:
-        (dest / "main.tex").write_bytes(gzip.decompress(data))
-        return "gzip_single_tex"
+        decompressed = gzip.decompress(data)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"unrecognised source payload: {exc}") from exc
+    if not decompressed:
+        raise ValueError("empty_source_payload")
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "main.tex").write_bytes(decompressed)
+    return "gzip_single_tex"
 
 
 def noise_summary(text: str) -> dict[str, int]:
@@ -106,15 +129,62 @@ def fetch_ids(client: ArxivClient, n: int) -> list[str]:
     return FALLBACK_IDS[:n]
 
 
+def _has_source_files(root: Path) -> bool:
+    """True when ``root`` is a directory that actually holds files.
+
+    An empty directory is not a cached source. Testing ``is_dir()`` alone made a
+    leftover empty ``src/`` look like a cache hit, so the paper was reported as
+    a missing entrypoint instead of a PDF-only submission.
+    """
+    try:
+        return root.is_dir() and any(root.iterdir())
+    except OSError:
+        return False
+
+
+def _starts_with_pdf(path: Path) -> bool:
+    """Read only the magic bytes; a cache copy may be tens of megabytes."""
+    try:
+        with path.open("rb") as handle:
+            return handle.read(4) == b"%PDF"
+    except OSError:
+        return False
+
+
+def _pdf_only_archive(path: Path) -> bool:
+    """True when the cached archive is a real PDF, not a tar or a gzip.
+
+    ``data[:4] == b"%PDF"`` alone is not enough: a tar stores its first member's
+    NAME at offset 0, so a TeX tarball whose first member is called
+    ``%PDF_something.tex`` would be taken for a PDF-only submission and skipped
+    on every run -- including the download run that would have parsed it.
+    """
+    if not path.is_file() or not _starts_with_pdf(path):
+        return False
+    try:
+        return not tarfile.is_tarfile(path)
+    except OSError:
+        return False
+
+
 def check_one(vid: str, *, use_cache: bool) -> dict:
     row: dict = {"id": vid}
     workdir = CACHE_ROOT / f"arXiv-{vid}"
     src = workdir / "src"
     # Support the flat layout too: a source manually unpacked straight into
     # data/cache/arXiv-<id>/ with the .tex files at the top level.
-    if not src.is_dir() and any(workdir.glob("*.tex")):
+    if not _has_source_files(src) and any(workdir.glob("*.tex")):
         src = workdir
-    cached = src.is_dir()
+    # A PDF-only submission caches its archive and nothing else; a PDF saved
+    # loose in the cache directory is the same submission. Either way the row
+    # must not claim the entrypoint is missing, or a known PDF-only paper looks
+    # like a parser failure in the scoreboard.
+    if not _has_source_files(src):
+        archive = workdir / "source.tar"
+        if _pdf_only_archive(archive) or (not archive.is_file() and any(workdir.glob("*.pdf"))):
+            row["error"] = "pdf_only_submission"
+            return row
+    cached = _has_source_files(src)
     if use_cache and not cached:
         row["error"] = "not_cached"
         return row
